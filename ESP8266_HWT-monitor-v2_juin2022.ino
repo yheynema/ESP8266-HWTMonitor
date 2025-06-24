@@ -4,12 +4,14 @@
  *  Date: juillet 2021
  *  Auteur: Y. Heynemand
  *  Plateforme visée: ESP8266 - ESP12-F  (4MB -> FS:1MB + OTA:~1019MB)
+ *     Choisir NodeMCU 1.0 ESP-12E (4MB -> FS:2MB + OTA:~1019MB
  *  Description: Ce sketch est un moniteur de consommation électrique (courant seulement) et 
  *               de temperature (entrées/sortie d'eau et réservoir).
  *  Fonctionnalités: REST API service
  *  Notes: Ce sketche est appellé à l'aide de http et du [nom de device].local (mDNS) sans arguments
  *         le sketche retourne un fichier index.html (et le client demandera le .css et le .js).
  *         Le client aura ensuite tout ce qu'il faut pour demander le data et afficher dans le template.
+ *  Utilise un tiny85 pour lire le courant, voir code: readCurrrent-sendSerial_tiny85_juin2021.ino
  *  
  *  -- Inspirations et credits: --
  *  Json parametric GET REST response with ArduinoJSON library
@@ -20,7 +22,7 @@
  */
 
 //--- Version et historique de developpement ----------------------------
-#define  _VERSION "1.7.8"
+#define  _VERSION "2.1.8"
 /*
  * 
  * v0.1.x: version initiale de test 
@@ -44,8 +46,18 @@
  * v1.7.3: 12 janv 2022 Yh: ajout de "mqttBaseTopic" dans getCfg, ajouté "MQTTLastMsgStatus" dans currentStatus     
  * v1.7.8: 27 mai 2022 Yh: ligne 1463 - tentative de corriger bug de transfert sr le seriel entre tiny85 et ESP8266 (ce code), PAS TESTÉ!  ATTENTION: le tiny85 n'envoie pas le char de terminaison '\n'
  * 
- * v2.0.x: Tester la possibilité d'utiliser le HW Serial au lieu du SW Serial. Ajouter des données du SW Serial. Tester stabilité.
- * v2.1+.y: ajout du détecteur d'eau (cas de fuite) et traitement, avis sonore, surveillance overheat
+ * v2.0.x: 28 mai 2022 Yh : modifier pour supporter Thingsboard au lieu de MQTT (simple) et eMonCMS
+ * 
+ * v2.1.x: 21 juillet 2023 Yh: PCB matériel, ajustement pour ESP-07 plutot qu'un ESP-12 (mauvais choix, btw)
+ *         déf pour WLD (Water Leak Detector) détecteur d'eau (cas de fuite) et traitement, avis sonore, surveillance overheat
+ *         déf pour LED RED+YEL et BUZZER
+ *         retiré support emonCMS
+ *         24 juillet 2023: bug majeur: crash lors de l'init Wifi et/ou en mode AP pour config Wifi... 
+ *
+ *
+ *
+ *
+ *
  * v3.x: multi-senseurs de courant (au moins un 2e), utilisation d'un ADC externe (AD7991) si trouve le prblm du ESP-12F et le I2C
  * v4.x: ajout d'un module de commande "energy saver" avec relais et cédule, controle électronique de maintient de la T
  * v5.x: support pour plusieurs chauffe-eau, surveillance de groupe?
@@ -55,11 +67,12 @@
  *    ajouter element dans la reponse JSON: deviceID et locationID (configurables). DeviceID est a la base = chipID ou DevName+3dernMACByte
  *    x OTA
  *    x versionning
+ *    Voir pour utiliser Preferences au lieu de EEPROM... ou sinon LittleFS  (voir RandomNerdsTut)
  *    param ICAL ajustable
  *    x save config EEPROM
  *    à tester - push dans emoncms (htttp), configurable (ip, clef, activ)
  *    à tester - push MQTT (ip, topic, activ)
- *    futur: support pour 2 current sensors
+ *    futur: support pour 2 current sensors - fait au niveau di tiny85 v1.1.4
  *    x cumul du temps où le courant est > (x)
  *    gérer une perte de connectivité Wifi
  *    à tester final - démélanger l'idée de stocker dans les array Average avec index... juste considérer le config lors de la présentation des données.
@@ -79,15 +92,16 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
-#include <ESP8266HTTPClient.h>
+//#include <ESP8266HTTPClient.h>  -- 24/07/2023: semble pas requis...
 #include <ESP8266HTTPUpdateServer.h>
 #include <EEPROM.h>
 #include <FS.h>
 #include <NTPClient.h>
 #include <OneWire.h>
-#include <PubSubClient.h>
+//#include <PubSubClient.h> -- inclus par TBPubSub et entrait en conflit
 #include <SoftwareSerial.h>
-//#include <SPIFFS.h>
+//#include <SPIFFS.h> -- voir FS.h
+#include <ThingsBoard.h>
 #include <TimeLib.h>
 #include <time.h>
 #include <Timezone.h>
@@ -99,6 +113,12 @@
 #define ONE_WIRE_BUS 4
 #define TEMPERATURE_PRECISION 9
 // #define LED_BUILTIN  (déjà définie)
+#define LED_RED_PIN 13
+#define LED_YEL_PIN 12
+#define BUZZ_PIN 15
+#define WLD01_PIN 5
+#define WLD02_PIN 2
+
 /*
  * logMQTTMode est un mot binaire dont les bits signifient:
  *  0 = OFF, pas de logging MQTT
@@ -115,7 +135,7 @@
 
 
 //--- Declaration des objets, constantes, et variables globales----------
-#define ESP8266
+//#define ESP8266  -- 21/07/2023: aparamment redéfinition... 
 #define webServicePort 80
 #define statusLedTimerDelay 1250L
 
@@ -127,7 +147,7 @@ const char* apSSID = "HWTMonSetup";
 const char* update_path = "/firmware";
 const char* update_username = "admin";
 const char* update_password = "admin";
-#define defaultDevName "HWTMonitor"
+#define defaultDevName "HWTMonitorV2"
 const char* deviceName = defaultDevName;
 
 
@@ -143,6 +163,10 @@ ESP8266HTTPUpdateServer httpUpdater;
 // -- Client MQTT
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
+
+// -- Client Thingsboard
+//WiFiClient espClientTB;
+ThingsBoardSized<200> tb(espClient);
 
 // -- Gestion de l'heure via NTP -------------------
 const int GTMOffset = 0;
@@ -195,11 +219,11 @@ const uint16_t schedROMOffset=128;  // voir detail du EEPROM mapping
 const uint16_t configBaseLocation=0;
 
 
-static const unsigned long STRUCT_MAGIC = 1234567143;  //3 derniers digit= _VERSION
+static const unsigned long STRUCT_MAGIC = 1234562014;  //3 derniers digit= _VERSION
 static const byte STRUCT_VERSION = 1;
 
 // -- Structure globale contenant l'état du système:
-typedef struct Status {
+struct Status {
 
   uint8_t tsync=0;
   float currentIValue = -1;
@@ -212,6 +236,9 @@ typedef struct Status {
   uint32_t activityStartTime=0;
   float currentTempSensorValue[numTempDev]= {0,0,0};
   bool spiffSucceded=false;
+  uint8_t TBConnected=false;
+  uint32_t lastTBConnect=0;
+  uint16_t tbConnectFailed=0;
 
   //Uptime data:
   uint32_t startTime=0;
@@ -219,7 +246,7 @@ typedef struct Status {
 
 };
 
-Status currentStatus;
+struct Status currentStatus;
 
 // -- Structure globale contenant la configuration du système:
 struct ConfigDataStruc {
@@ -231,6 +258,7 @@ struct ConfigDataStruc {
 
   uint8_t logMQTTMode; // 0=off, voir ci-haut les modes
   uint8_t emoncmsMode;
+  uint8_t tbMode;
   uint32_t getTempTimerDelay;
   uint32_t minActDuration;
   uint8_t loopCount; // numb retries value for wifi connection 
@@ -242,6 +270,10 @@ struct ConfigDataStruc {
   uint8_t emoncmsIp[4];
   int emoncmsTcp;
   char emoncmsKey[32+1];
+
+  uint8_t tbHostIp[4];
+  char tbToken[32+1];
+  uint32_t tbRetryDelay;
 
   uint8_t mqttIp[4];
   int mqttPort;
@@ -288,7 +320,7 @@ static String getDateTimeStringByParams(tm *, char* );
 static String getEpochStringByParams(long time, char* );
 uint8_t goReadCurrentSensor(void);
 uint8_t pushDataToMQTT(void);
-uint8_t pushDataToEMONCMS(void);
+//uint8_t pushDataToEMONCMS(void);  -- N'est plus supporté
 uint8_t goReadTemperatureSensors(void);
 //-----------------------------------------------------------------------
 
@@ -503,7 +535,9 @@ void loadFromEEPROM(bool returnToDefault) {
     ms.currentIThreshold = 1;
     
     ms.logMQTTMode=0;    // 0=off, bits: 0=temp msg , 1=star events. 2=stop events, 3=bucket full event, 4=remote low batt, 5=remote status, etc
-    
+
+    ms.tbMode=0; //Thingsboard
+
 //    ms.minNumberofSamples = aggrSize/2; //nombre minimal d'echantillon requis pour un fonctionnement normal
 
     ms.wifiConnectDelay=30;
@@ -529,6 +563,14 @@ void loadFromEEPROM(bool returnToDefault) {
     ms.emoncmsIp[3] = 203;
     ms.emoncmsTcp = 80;
 
+    ms.tbMode=0; //Thingsboard
+    ms.tbHostIp[0]= 192;
+    ms.tbHostIp[1]= 168;
+    ms.tbHostIp[2]= 122;
+    ms.tbHostIp[3]= 210;
+    strcpy(ms.tbToken,"uUiPWTycMqRDGy5RnU7j");
+    ms.tbRetryDelay = 20000; //Delais entre 2 tentatives
+
     ms.wifiConnectDelay = 60; // 60 seconds
     
     strcpy(ms.devName,deviceName);
@@ -550,7 +592,11 @@ void loadFromEEPROM(bool returnToDefault) {
  */
 boolean attemptWifiConnection(void) {
   int count = 0;
-  uint16_t loopDelay = (((uint16_t)(ms.wifiConnectDelay)) / ms.loopCount) * 1000;
+
+  uint8_t loopCount = 10;
+  if (ms.loopCount>0)
+    loopCount = ms.loopCount;
+  uint16_t loopDelay = (((uint16_t)(ms.wifiConnectDelay)) / loopCount) * 1000;
 
   WiFi.hostname(ms.devName);
   WiFi.begin(ms.ssid, ms.password);
@@ -572,9 +618,9 @@ boolean attemptWifiConnection(void) {
     }
     delay(loopDelay);  
     count++;
-    digitalWrite(LED_BUILTIN,count%2);
+    digitalWrite(LED_YEL_PIN,count%2);
   }
-  Serial.println("Timed out.");
+  Serial.println("Wifi connect timed out");
   return false;
 }
 
@@ -601,11 +647,14 @@ void setupMode(void) {
     ssidList += WiFi.SSID(i);
     ssidList += "</option>";
   }
+  WiFi.disconnect();
   delay(100);
   WiFi.mode(WIFI_AP);
+  delay(100);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  delay(100);
   WiFi.softAP(apSSID);
-  //dnsServer.start(53, "*", apIP);
+  delay(100);
   startWebServer();
   Serial.print("Starting Access Point at \"");
   Serial.print(apSSID);
@@ -834,6 +883,10 @@ void getSettings(void) {
         doc["logMQTTMode"] = ms.logMQTTMode;
         doc["MQTTconnexion"] = currentStatus.MQTTConnected;
         doc["MQTTLastMsgStatus"] = currentStatus.MQTTLastMsgSuccess;
+        doc["tbMode"] = ms.tbMode;
+        doc["tbStatus"] = currentStatus.TBConnected;
+        doc["tbFailure"] = currentStatus.tbConnectFailed;
+        doc["tbConnectDly"] = ms.tbRetryDelay;
         doc["emoncmsMode"] = ms.emoncmsMode;
         doc["getTempTimerDelay"] = ms.getTempTimerDelay;
         doc["loopCount"] = ms.loopCount;
@@ -842,17 +895,21 @@ void getSettings(void) {
           tsensorArr.add(ms.TsensorIndex[i]);
         }
         doc["currentIThreshold"] = ms.currentIThreshold;
-        IPAddress emonip(ms.emoncmsIp);
-        
-        doc["emonip"] = emonip.toString();
-        
+        IPAddress emonip(ms.emoncmsIp);        
+        doc["emonip"] = emonip.toString();        
         doc["emoncmsTcp"] = ms.emoncmsTcp;
         doc["emoncmsKey"] = ms.emoncmsKey;
+        
         IPAddress mqttIp(ms.mqttIp);
         doc["mqttIp"] = mqttIp.toString();
         doc["mqttPort"] = ms.mqttPort;
         doc["mqttUser"] = ms.mqttUser;
         doc["mqttPassword"] = ms.mqttPassword;
+        
+        IPAddress tbHostIp(ms.tbHostIp);
+        doc["tbHostIp"] = tbHostIp.toString();
+        doc["tbToken"] = ms.tbToken;
+
         uint8_t num = (uint8_t)(ESP.getChipId() & 0x000000FF);
         doc["mqttBaseTopic"] = "esphwt_"+String(num,HEX);
         doc["devName"] = ms.devName;
@@ -1037,7 +1094,21 @@ void setSettings(void) {
                 reply["logMQTTMode"] = "noChg";
             }
          } // Cas de logMQTTMode;
-          
+
+         if (postObj.containsKey("tbMode")) {
+            if (ms.tbMode != postObj["tbMode"]) {
+               if (postObj["tbMode"]>=0 && postObj["tbMode"]<16) {
+                  ms.tbMode = postObj["tbMode"];
+                  reply["tbMode"]="success";
+                  needToSaveEEPROM++;
+                } else {
+                  reply["tbMode"] = "invalidMode";
+                }
+            } else {
+                reply["tbMode"] = "noChg";
+            }
+         } // Cas de tbMode;
+        
          if (postObj.containsKey("emoncmsMode")) {
             if (ms.emoncmsMode != postObj["emoncmsMode"]) {
                ms.emoncmsMode = postObj["emoncmsMode"];
@@ -1069,7 +1140,30 @@ void setSettings(void) {
               reply["emonIp"] = "invalidIp";
             }
          } // Cas de emonIp
-         
+
+
+         if (postObj.containsKey("tbHostIp")) {
+            IPAddress tbHostIp;
+            // Test si c'est une adresse IP valide
+            if (tbHostIp.fromString(postObj["tbHostIp"].as<String>())) {
+               bool foundOneChg = false;
+               for (uint8_t i=0; i<4; i++) {
+                 if (ms.tbHostIp[i] != tbHostIp[i]) {
+                   ms.tbHostIp[i]= tbHostIp[i];
+                   foundOneChg = true;
+                 }
+               }
+               if (foundOneChg) {
+                  reply["tbHostIp"] = "success";
+                  needToSaveEEPROM++;
+               } else {
+                  reply["tbHostIp"] = "noChg";
+               }
+            } else {
+              reply["tbHostIp"] = "invalidIp";
+            }
+         } // Cas de tbHostIp
+
          if (postObj.containsKey("mqttIp")) {
             IPAddress mqttIp;
             if (mqttIp.fromString(postObj["mqttIp"].as<String>())) {
@@ -1160,6 +1254,16 @@ void setSettings(void) {
              reply["devName"] = "invalidLength";
            }
          } // Cas de devName
+
+         if (postObj.containsKey("tbToken")) {
+           if (postObj["tbToken"].as<String>().length()>0 && postObj["tbToken"].as<String>().length()<32) {
+             strcpy(ms.tbToken, postObj["tbToken"]);
+             reply["tbToken"]="success";
+             needToSaveEEPROM++;
+           } else {
+             reply["tbToken"] = "invalidLength";
+           }
+         } // Cas de tbToken
          
          if (postObj.containsKey("ssid")) {
            if (postObj["ssid"].as<String>().length()>0 && postObj["ssid"].as<String>().length()<32) {
@@ -1476,6 +1580,7 @@ bool getCurrentI(float& curVal) {
           inStr[++ptr] = oneChar;
       else signOff=true;
       inStr[ptr+1]=0;
+      delay(1); //let next char coming in (9 bits @9600b/s takes about 1ms)
     }
     tempStrI = String(inStr);
 
@@ -1495,6 +1600,45 @@ bool getCurrentI(float& curVal) {
   }
   return success;
 }
+
+/*
+ * Nom: checkTBConnexion
+ * Fonction: tente une connexion au serveur TB si n'est pas connecté 
+ * Argument(s) réception: rien
+ * Argument(s) de retour: un booléen = operation réussie ou non
+ * Modifie/utilise (globale):
+ * Notes: isSubcribe a été mis en commentaire, car ici n'utilise pas RPC (au 28 mai 2022)
+ * 
+ */
+bool checkTBConnexion(void) {
+  // Reconnect to ThingsBoard, if needed
+  bool retCode=false;
+  if (!tb.connected()) {
+    if (millis() > currentStatus.lastTBConnect+ms.tbRetryDelay) {
+  //    isSubcribed = false;
+      //Récupération des valeurs (Preferences):
+      //String tbhost = mesPreferences.getString("TBHOST","");
+      //String tbtoken = mesPreferences.getString("TBTOKEN","");
+      // Connect to the ThingsBoard
+      Serial.print("Connecting to: ");
+      IPAddress tbHostIp(ms.tbHostIp);  //Forger un objet IPAddress à partir des 4 bytes
+      Serial.print(tbHostIp.toString());
+      Serial.print(" with token ");
+      Serial.println(ms.tbToken);
+      if (tb.connect(tbHostIp.toString().c_str(), ms.tbToken)) {
+        retCode=true;
+        currentStatus.lastTBConnect=millis();
+      } else {
+        Serial.println("Failed to connect to TB");
+        currentStatus.tbConnectFailed++;
+        retCode=false;
+      }
+    }
+  } else retCode=true;
+  currentStatus.TBConnected=retCode;
+  return retCode;
+}
+
 
 /*
  * Nom: 
@@ -1665,6 +1809,70 @@ uint8_t pushDataToMQTT(void) {
 }
 
 /*
+ * Nom: pushDataToTB
+ * Fonction:  envoyer 5 données de télémétrie et 5 données d'attributs vers TB
+ * Argument(s) réception: 
+ * Argument(s) de retour: bool indiquant le succes de l'opération d'envoie
+ * Modifie/utilise (globale):  utilise les données courantes contenues dans currentStatus
+ * Notes:  à analyser: retCode
+ * 
+ */ 
+int8_t pushDataToTB(void) {
+  int8_t retCode = -3;  //Code de retour indiquant un problème
+  if (WiFi.status()== WL_CONNECTED) {
+    retCode = -2;
+    if (ms.tbMode && currentStatus.TBConnected) {
+      retCode -1;
+      bool success=false;
+      bool attribSuccess=false;
+      const int data_items = 5;
+      Telemetry data[data_items] = {
+        { "currentI",currentStatus.currentIValue },
+        { "activity",currentStatus.activiteCourante },
+        { "tempC1", currentStatus.currentTempSensorValue[ms.TsensorIndex[0]] },
+        { "tempC2",currentStatus.currentTempSensorValue[ms.TsensorIndex[1]] },
+        { "tempC3",currentStatus.currentTempSensorValue[ms.TsensorIndex[2]] }
+      };
+
+      if (tb.sendTelemetry(data, data_items)) success=true; else success=false;
+
+      retCode = success;
+
+      // Envoie des attributs
+      if (success)  {
+        uint32_t chipID = ESP.getChipId();
+        //ESP32: String  = String(ESP.getChipModel())+"-"+String(ESP.getChipRevision());
+
+        //Utiliser les 2 derniers bytes du MAC pour en faire le devID
+        byte mac[WL_MAC_ADDR_LENGTH];
+        WiFi.macAddress(mac);
+        uint16_t systemID = mac[4];
+        systemID = systemID << 8 + mac[5];
+        String deviceID = "HWTMON_"+String(systemID,HEX);
+        char macAddrC[20]={};
+        sprintf(macAddrC,"%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+      
+        const int attribute_items = 8;
+        Attribute attributes[attribute_items] = {
+           { "device_type",  "sensor" },
+           { "active",       true     },
+           { "deviceID", deviceID.c_str() },
+           { "firmware", _VERSION },
+           { "chipID", String(chipID,HEX).c_str() },
+           { "flashChipId", String(ESP.getFlashChipId()).c_str() },
+           { "macAddr", String(macAddrC).c_str() },
+           { "IPaddr", WiFi.localIP().toString().c_str() }
+        };
+        if (tb.sendAttributes(attributes, attribute_items)) attribSuccess=true; else attribSuccess=false;
+
+        retCode += attribSuccess;
+      }
+    }
+  }
+  return retCode;
+}
+
+/*
  * Nom: 
  * Fonction: 
  * Argument(s) réception: (rien)
@@ -1673,39 +1881,39 @@ uint8_t pushDataToMQTT(void) {
  * Notes:  (spécial, source, amélioration, etc)
  * 
  */ 
-uint8_t pushDataToEMONCMS(void) {
-  if (ms.emoncmsMode && WiFi.status()== WL_CONNECTED) {
-    WiFiClient localClient;
-    HTTPClient localHttp;
+// uint8_t pushDataToEMONCMS(void) {
+//   if (ms.emoncmsMode && WiFi.status()== WL_CONNECTED) {
+//     WiFiClient localClient;
+//     HTTPClient localHttp;
 
-    //Assemblage du serverName
-    IPAddress emoncmsSvr(ms.emoncmsIp);
-    String url = "http://"+emoncmsSvr.toString()+":"+String(ms.emoncmsTcp)+"/emoncms/input/post";
-    DynamicJsonDocument emonData(128);
-    emonData["tempC1"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[0]],1);
-    emonData["tempC2"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[1]],1);
-    emonData["tempC3"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[2]],1);
-    emonData["currentI"]=String(currentStatus.currentIValue,2);
-    emonData["activity"]=String(currentStatus.activiteCourante);
-    String outbuff;
-    serializeJson(emonData,outbuff);
-    //Suggestion amélioration: ajouter un byte après hwtmon pour en faire un ID unique
-    uint8_t num = (uint8_t)(ESP.getChipId() & 0x000000FF);
-    outbuff = "apikey="+String(ms.emoncmsKey)+"&node=hwtmon_"+String(num,HEX)+"&data="+outbuff;
-    localHttp.begin(localClient, url);
-    localHttp.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    localHttp.addHeader("Authorization", "Bearer "+String(ms.emoncmsKey));  //incomplet...
+//     //Assemblage du serverName
+//     IPAddress emoncmsSvr(ms.emoncmsIp);
+//     String url = "http://"+emoncmsSvr.toString()+":"+String(ms.emoncmsTcp)+"/emoncms/input/post";
+//     DynamicJsonDocument emonData(128);
+//     emonData["tempC1"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[0]],1);
+//     emonData["tempC2"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[1]],1);
+//     emonData["tempC3"]=String(currentStatus.currentTempSensorValue[ms.TsensorIndex[2]],1);
+//     emonData["currentI"]=String(currentStatus.currentIValue,2);
+//     emonData["activity"]=String(currentStatus.activiteCourante);
+//     String outbuff;
+//     serializeJson(emonData,outbuff);
+//     //Suggestion amélioration: ajouter un byte après hwtmon pour en faire un ID unique
+//     uint8_t num = (uint8_t)(ESP.getChipId() & 0x000000FF);
+//     outbuff = "apikey="+String(ms.emoncmsKey)+"&node=hwtmon_"+String(num,HEX)+"&data="+outbuff;
+//     localHttp.begin(localClient, url);
+//     localHttp.addHeader("Content-Type", "application/x-www-form-urlencoded");
+//     localHttp.addHeader("Authorization", "Bearer "+String(ms.emoncmsKey));  //incomplet...
 
-    int httpResponseCode = localHttp.POST(outbuff);
-    Serial.print("HTTP Response code: ");
-    Serial.println(httpResponseCode);
+//     int httpResponseCode = localHttp.POST(outbuff);
+//     Serial.print("HTTP Response code: ");
+//     Serial.println(httpResponseCode);
 
-    // Free resources after sending...
-    localHttp.end();
-    localClient.stop();
-  }
-  return 1;
-}
+//     // Free resources after sending...
+//     localHttp.end();
+//     localClient.stop();
+//   }
+//   return 1;
+// }
 
 //-----------------------------------------------------------------------
 
@@ -1713,7 +1921,20 @@ uint8_t pushDataToEMONCMS(void) {
 //--- Setup et Loop -----------------------------------------------------
 
 void setup(void) {
+  pinMode(LED_RED_PIN,OUTPUT);
+  digitalWrite(LED_RED_PIN,LOW);
+  pinMode(LED_YEL_PIN,OUTPUT);
+  digitalWrite(LED_YEL_PIN,LOW);
+  pinMode(BUZZ_PIN,OUTPUT);
+  digitalWrite(BUZZ_PIN,HIGH);
+
+  pinMode(WLD01_PIN,INPUT);
+  pinMode(WLD02_PIN,INPUT);
+  
   Serial.begin(115200);
+  while(!Serial) yield();
+  Serial.println("\n");
+
   swser.begin(9600);
 
   EEPROM.begin(512);
@@ -1723,10 +1944,9 @@ void setup(void) {
   Serial.println(_VERSION);
   Serial.println ("Setting up Wifi");
 
-  pinMode(LED_BUILTIN,OUTPUT);
-  digitalWrite(LED_BUILTIN,LOW);
-  
+  digitalWrite(LED_YEL_PIN,HIGH);
 
+  digitalWrite(BUZZ_PIN,LOW);
 
 // Attente de la connexion au réseau WiFi / Wait for connection
   if (!attemptWifiConnection()) {
@@ -1737,14 +1957,18 @@ void setup(void) {
       server.handleClient();
       if (millis() > currentStatus.statusLedTimer) {
         currentStatus.statusLedTimer = millis() + statusLedTimerDelay/2;
-        digitalWrite(LED_BUILTIN,!digitalRead(LED_BUILTIN));
+        digitalWrite(LED_YEL_PIN,!digitalRead(LED_YEL_PIN));
       }
     }
   }
 
+digitalWrite(LED_YEL_PIN,HIGH);
 
   timeClient.begin();
   delay ( 1000 );
+
+digitalWrite(LED_YEL_PIN,LOW);
+
   if (timeClient.update()){
      Serial.print ( F("Adjust local clock") );
      unsigned long epoch = timeClient.getEpochTime();
@@ -1763,6 +1987,8 @@ void setup(void) {
     Serial.println(F("MDNS responder started"));
   }
 
+digitalWrite(LED_YEL_PIN,HIGH);
+
   if (SPIFFS.begin()) { 
     currentStatus.spiffSucceded=true;
     DynamicJsonDocument spiffContent(512);
@@ -1777,11 +2003,20 @@ void setup(void) {
     currentStatus.spiffSucceded=false;
     Serial.println(F("Failed to initialize SPIFFS"));
   }
-  
+
+digitalWrite(LED_YEL_PIN,LOW);
 
   if (ms.logMQTTMode>0) {
     if (initMQTTConnection()) currentStatus.MQTTConnected=true;
   }
+
+digitalWrite(LED_YEL_PIN,HIGH);
+
+  if (ms.tbMode>0) {
+    currentStatus.TBConnected = checkTBConnexion();
+  }
+  
+digitalWrite(LED_YEL_PIN,LOW);
 
   // Start up the library
   sensors.begin();
@@ -1792,6 +2027,8 @@ void setup(void) {
   Serial.print(F("Found "));
   Serial.print(sensors.getDeviceCount(), DEC);
   Serial.println(F(" devices."));
+
+digitalWrite(LED_YEL_PIN,HIGH);
 
   //Find device 1wire addresses, print addresses, set resolution
   for (uint8_t i=0; i<numTempDev; i++) {
@@ -1806,7 +2043,9 @@ void setup(void) {
 
   Serial.print(F("Requesting temperatures..."));
   sensors.requestTemperatures();
-  
+
+digitalWrite(LED_YEL_PIN,LOW);
+
   // Set server routing
   restServerRouting();
   
@@ -1817,8 +2056,13 @@ void setup(void) {
 
   Serial.println("HTTP server started");
 
+digitalWrite(LED_YEL_PIN,HIGH);
+
   httpUpdater.setup(&server,update_path,update_username,update_password);
   server.begin();
+
+digitalWrite(LED_YEL_PIN,LOW);
+
   currentStatus.activiteCourante=-1; //0=OFF, 1=ON, -1=non-initialisée
   currentStatus.activitePrecedente=-1;
   currentStatus.activityStartTime=0;
@@ -1828,11 +2072,20 @@ void setup(void) {
  
 void loop(void) {
   server.handleClient();
-  mqttClient.loop();
+  if (ms.logMQTTMode>0) {
+    mqttClient.loop();
+  }
+  if (ms.tbMode>0) {
+    if (checkTBConnexion()) {
+      tb.loop();
+    } else {
+      currentStatus.tbConnectFailed++;
+    }
+  }
 
   if (millis() > currentStatus.statusLedTimer) {
     currentStatus.statusLedTimer = millis() + statusLedTimerDelay;
-    digitalWrite(LED_BUILTIN,!digitalRead(LED_BUILTIN));
+    digitalWrite(LED_YEL_PIN,!digitalRead(LED_YEL_PIN));
   }
   
   //request temp every (getTempTimerDelay) msec
@@ -1862,7 +2115,10 @@ void loop(void) {
     uint8_t resultMQTT = pushDataToMQTT();
     
    // Traiter ici l'envoi à emonCMS si ms.emoncmsMode true;
-   uint8_t resultEMON = pushDataToEMONCMS();
+   //21/07/2023 Yh: non, plus requis: uint8_t resultEMON = pushDataToEMONCMS();
+
+   // Traiter ici l'envoi à Thingsboard:
+   int8_t resultTB = pushDataToTB();
    
   } // Toutes les (getTempTimerDelay) milisecondes
   MDNS.update();
